@@ -1,0 +1,221 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOMAIN: myurls.yashwanthgowdam.in
+  DEPLOY_PATH: /opt/url-dashboard
+
+jobs:
+  backend:
+    name: Backend - lint and test
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: pytest -q
+
+  frontend:
+    name: Frontend - lint, test and build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; \
+          else npm install --no-audit --no-fund; fi
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test
+      - name: Type-check and build
+        run: npm run build
+
+  security-gate:
+    name: Build images and Trivy gate
+    needs: [backend, frontend]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Docker Compose file
+        env:
+          ADMIN_PASSWORD: validation-only-password
+          JWT_SECRET: validation-only-secret-validation-only-secret
+        run: docker compose config --quiet
+
+      - name: Build Docker images
+        run: |
+          docker build -t urlmgmt-backend:ci ./backend
+          docker build -t urlmgmt-frontend:ci ./frontend
+          docker pull nginx:1.27-alpine
+
+      - name: Scan images with Trivy
+        run: |
+          mkdir -p trivy-reports
+          scan() {
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$PWD/trivy-reports:/reports" \
+              -v trivy-cache:/root/.cache \
+              aquasec/trivy:latest image \
+              --quiet --scanners vuln --ignore-unfixed \
+              --format json --output "/reports/$1.json" "$2"
+          }
+          scan backend  urlmgmt-backend:ci
+          scan frontend urlmgmt-frontend:ci
+          scan nginx    nginx:1.27-alpine
+
+      - name: Evaluate vulnerability policy
+        run: |
+          count() {
+            jq -s "[.[] | .Results[]?.Vulnerabilities[]? | select(.Severity==\"$1\")] | length" trivy-reports/*.json
+          }
+          CRITICAL=$(count CRITICAL)
+          HIGH=$(count HIGH)
+          MEDIUM=$(count MEDIUM)
+          LOW=$(count LOW)
+          TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW))
+          HIGH_PLUS_CRITICAL=$((HIGH + CRITICAL))
+
+          {
+            echo "### Trivy vulnerability report (fixable issues, all images)"
+            echo ""
+            echo "| Severity | Count | Policy |"
+            echo "|---|---|---|"
+            echo "| CRITICAL + HIGH | ${HIGH_PLUS_CRITICAL} | must be < 2 |"
+            echo "| MEDIUM | ${MEDIUM} | reported only |"
+            echo "| LOW | ${LOW} | must be < 8 |"
+            echo "| Total | ${TOTAL} | preferably < 10 |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          FAILED=0
+          if [ "$HIGH_PLUS_CRITICAL" -ge 2 ]; then
+            echo "::error::HIGH + CRITICAL vulnerabilities ($HIGH_PLUS_CRITICAL) must be less than 2"
+            FAILED=1
+          fi
+          if [ "$LOW" -ge 8 ]; then
+            echo "::error::LOW vulnerabilities ($LOW) must be less than 8"
+            FAILED=1
+          fi
+          if [ "$MEDIUM" -gt 0 ]; then
+            echo "::warning::$MEDIUM MEDIUM vulnerabilities found (reported only)"
+          fi
+          if [ "$TOTAL" -ge 10 ]; then
+            echo "::warning::Total vulnerabilities ($TOTAL) is not below the preferred limit of 10"
+          fi
+          if [ "$FAILED" -eq 1 ]; then
+            echo "Security policy failed. Deployment cancelled."
+            exit 1
+          fi
+          echo "Security policy passed."
+
+      - name: Upload Trivy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports
+          path: trivy-reports/
+          retention-days: 30
+
+  deploy:
+    name: Deploy to OCI
+    needs: security-gate
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    environment: production
+    env:
+      OCI_HOST: ${{ secrets.OCI_HOST }}
+      OCI_USER: ${{ secrets.OCI_USER }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH (PEM key only)
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.OCI_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key.pem
+          chmod 600 ~/.ssh/deploy_key.pem
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<CONFIG
+          Host oci
+            HostName ${OCI_HOST}
+            User ${OCI_USER}
+            IdentityFile ~/.ssh/deploy_key.pem
+            IdentitiesOnly yes
+            PasswordAuthentication no
+            StrictHostKeyChecking yes
+          CONFIG
+
+      - name: Upload latest code
+        run: |
+          rsync -az --delete \
+            --exclude '.git' --exclude '.github' --exclude 'node_modules' \
+            --exclude '.env' --exclude 'backups' \
+            ./ "oci:${DEPLOY_PATH}/"
+
+      - name: Build and start containers
+        run: |
+          ssh oci "cd '${DEPLOY_PATH}' \
+            && test -f .env \
+            && docker compose up -d --build --remove-orphans \
+            && docker compose restart nginx \
+            && docker image prune -f"
+
+      - name: Verify container health
+        run: |
+          ssh oci bash -s -- "${DEPLOY_PATH}" <<'REMOTE'
+          set -euo pipefail
+          cd "$1"
+          for attempt in $(seq 1 40); do
+            all_healthy=true
+            for container in urlmgmt-backend urlmgmt-frontend urlmgmt-nginx; do
+              status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container" 2>/dev/null || echo missing)
+              [ "$status" = "healthy" ] || all_healthy=false
+            done
+            if [ "$all_healthy" = true ]; then
+              echo "All containers are healthy."
+              exit 0
+            fi
+            sleep 5
+          done
+          docker compose ps
+          docker compose logs --tail=60
+          exit 1
+          REMOTE
+
+      - name: Verify the public site
+        run: |
+          curl -fsS --retry 10 --retry-delay 5 --retry-all-errors "https://${DOMAIN}/api/health" | grep -q '"status":"ok"'
+          echo "Deployment successful: https://${DOMAIN}"
